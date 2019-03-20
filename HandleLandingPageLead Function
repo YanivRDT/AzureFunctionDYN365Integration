@@ -1,0 +1,139 @@
+#r "Newtonsoft.Json"
+
+using System.Net;
+using System.Text;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using System.Net.Http.Headers;
+using Microsoft.Azure.KeyVault;
+using System.Text.RegularExpressions;
+using Microsoft.Azure.Services.AppAuthentication;
+using Microsoft.IdentityModel.Clients.ActiveDirectory;
+
+// represents DYN365 Web API access details
+internal class AccessDetails
+{
+    internal string WebAPIURL { get; set; }
+    internal string ApplicationId { get; set; }
+    internal string Secret { get; set; }
+}
+
+// represents Lead data
+internal class Lead
+{
+    internal string subject { get; set; }
+    internal string firstname { get; set; }
+    internal string lastname { get; set; }
+    internal string emailaddress1 { get; set; }
+    internal string mobilephone { get; set; }
+}
+
+// Hanlde Lead landing page request 
+public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
+{
+    log.Info("request received");
+
+    //parse request into Lead object
+    string jsonContent = await req.Content.ReadAsStringAsync();
+    var lead = JsonConvert.DeserializeObject<Lead>(jsonContent);
+
+    //retrieve DYN365 access details from Azure Key Vault 
+    AccessDetails accessDetails = await GetDyn365AccessDetails();
+
+    //use access details to receive DYN365 access token 
+    string accessToken = GetWebAPIAccessToken(accessDetails);
+
+    //create DYN365 Lead record 
+    string leadId = await CreateDYN365Lead(lead, accessDetails, accessToken);
+    
+    //return response to the caller 
+    return req.CreateResponse(HttpStatusCode.OK, $"Lead processed successfully: {leadId}");
+}
+
+// extract DYN365 access details from Azure Key Vault
+private static async Task<AccessDetails> GetDyn365AccessDetails()
+{
+    AccessDetails result = new AccessDetails();
+
+    string dyn365WebAPIURL = "https://leadlandingpageakv.vault.azure.net/secrets/DYN365InstanceURL";
+    string dyn365AppIdKVURL = "https://leadlandingpageakv.vault.azure.net/secrets/applicationId";
+    string dyn365secretKVURL = "https://leadlandingpageakv.vault.azure.net/secrets/secret";
+
+    // extract sensitive data from Azure Key Vault     
+    AzureServiceTokenProvider azureServiceTokenProvider = new AzureServiceTokenProvider();
+    var keyVaultClient = new KeyVaultClient(new KeyVaultClient.AuthenticationCallback(azureServiceTokenProvider.KeyVaultTokenCallback));
+
+    //extract Web API URL
+    var dyn365WebAPISecret = await keyVaultClient.GetSecretAsync(dyn365WebAPIURL).ConfigureAwait(false);
+    result.WebAPIURL = dyn365WebAPISecret.Value;
+
+    //extract application id  
+    var appUserappIdSecret = await keyVaultClient.GetSecretAsync(dyn365AppIdKVURL).ConfigureAwait(false);
+    result.ApplicationId = appUserappIdSecret.Value;
+    
+    //extract secret 
+    var Secret = await keyVaultClient.GetSecretAsync(dyn365secretKVURL).ConfigureAwait(false);
+    result.Secret = Secret.Value;
+
+    return result;
+}
+
+// Get Web API access token 
+private static string GetWebAPIAccessToken(AccessDetails accessDetails)
+{
+    String result = string.Empty;
+    string webAPIURL = accessDetails.WebAPIURL;
+
+    AuthenticationParameters ap = AuthenticationParameters.CreateFromResourceUrlAsync(new Uri(webAPIURL)).Result;
+    AuthenticationContext authContext = new AuthenticationContext(ap.Authority);
+    var credentials = new ClientCredential(accessDetails.ApplicationId, accessDetails.Secret);
+    result = authContext.AcquireTokenAsync(ap.Resource, credentials).Result.AccessToken;
+
+    return result;
+}
+
+// Create Dynamics 365 Lead record using access details and access token 
+private static async Task<string> CreateDYN365Lead(Lead lead, AccessDetails accessDetails, string accessToken)
+{
+    string result = string.Empty;   
+
+    //convert lead to JObject 
+    JObject leadObj = JObject.FromObject(lead);
+
+    //set channel & headers 
+    var httpClient = new HttpClient
+    {
+        BaseAddress = new Uri(accessDetails.WebAPIURL),
+        Timeout = new TimeSpan(0, 2, 0)
+    };
+    
+    httpClient.DefaultRequestHeaders.Add("OData-MaxVersion", "4.0");
+    httpClient.DefaultRequestHeaders.Add("OData-Version", "4.0");
+    httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+    //set request 
+    HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, "leads")
+    {
+        Content = new StringContent(leadObj.ToString(), Encoding.UTF8, "application/json")
+    };
+
+    //send request and handle response 
+    HttpResponseMessage response = await httpClient.SendAsync(request); 
+
+    // handle success - extract created record URL 
+    if (response.StatusCode == HttpStatusCode.NoContent)
+    {            
+        string leadURL = response.Headers.GetValues("OData-EntityId").FirstOrDefault();
+        
+        //extract GUID from URL
+        result = Regex.Match(leadURL, @"\(([^)]*)\)").Groups[1].Value;                                 
+    }
+    //handle failure 
+    else 
+    {
+        result = "Something went wrong :(";
+    }
+    
+    return result;
+}
